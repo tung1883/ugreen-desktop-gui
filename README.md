@@ -1,12 +1,42 @@
-# UGREEN Studio Pro — Bluetooth Control Protocol
+# UGREEN Studio Pro PC Control
 
-## Transport
+A reverse-engineered PC client and GUI for controlling UGREEN Studio Pro headphones over Bluetooth, without the phone app.
+
+## Usage
+
+Standalone: run `UgreenStudioProControl.exe`.
+
+From source: `python ugreen_gui.py` (requires `pyserial`).
+
+The headphones must be paired with Windows first (as a classic Bluetooth device). The app auto-detects the outgoing SPP COM port and connects on startup.
+
+### As a library
+
+```python
+from ugreen_client import UgreenClient, EQ_BASS, ANC_LEVEL_GENERAL
+
+with UgreenClient("COM8") as client:
+    client.set_eq_preset(EQ_BASS)
+    client.set_anc_level(ANC_LEVEL_GENERAL)
+    client.set_spatial_audio(True)
+```
+
+## Building the exe
+
+```
+pip install pyinstaller
+python -m PyInstaller --onefile --windowed --name "UgreenStudioProControl" --icon ugreen_logo.ico --add-data "ugreen_logo.png;." --add-data "ugreen_logo.ico;." ugreen_gui.py
+```
+
+## Protocol
+
+### Transport
 
 - Classic Bluetooth SPP (RFCOMM), not BLE.
 - SPP UUID: `00001101-0000-1000-8000-00805F9B34FB`.
 - Windows exposes a paired SPP device as an outgoing COM port (Settings → Bluetooth & devices → Devices → More Bluetooth settings → COM Ports tab).
 
-## Command frame
+### Command frame
 
 ```
 AA BB CC | CMD(1) | LEN(1) | PARAM(LEN) | CRC16(2, little-endian)
@@ -14,7 +44,7 @@ AA BB CC | CMD(1) | LEN(1) | PARAM(LEN) | CRC16(2, little-endian)
 
 CRC-16/MODBUS (poly `0x8005`, init `0xFFFF`, reflected in/out), computed over `CMD + LEN + PARAM` (prefix excluded).
 
-## Response frame
+### Response frame
 
 ```
 DD EE FF | CMD(1) | subtype(1) | LEN(1) | PARAM(LEN) | CRC16(2, little-endian)
@@ -22,14 +52,14 @@ DD EE FF | CMD(1) | subtype(1) | LEN(1) | PARAM(LEN) | CRC16(2, little-endian)
 
 Set-commands get an ack response echoing `CMD`/`PARAM`.
 
-## Command IDs are contextual
+### Command IDs are contextual
 
 Some command IDs mean different things depending on device state or app screen:
 
 - `CMD 0x09` param `0xA1` = plain ANC on OR ANC level Ultra, depending on whether ANC was already on.
 - To reliably select an ANC level, send `0xA1` (ANC on) first, then the level byte.
 
-## Commands
+### Commands
 
 | CMD | Feature | Param |
 |---|---|---|
@@ -52,7 +82,7 @@ Some command IDs mean different things depending on device state or app screen:
 
 Action codes (`0x0A`/`0x14`/`0x15`): `0`=No action, `4`=Next track, `5`=Previous track, `7`=Game mode, `8`=ANC cycle, `11`=Spatial audio.
 
-## Status query (`CMD 0x04`)
+### Status query (`CMD 0x04`)
 
 Response `PARAM` byte offsets:
 
@@ -74,7 +104,7 @@ Response `PARAM` byte offsets:
 | `20` | Spatial audio |
 | `25` | Wind noise reduction |
 
-## Connected-devices query (`CMD 0x0D`)
+### Connected-devices query (`CMD 0x0D`)
 
 Returns nothing (zero-byte response) while Dual Link is off. While on, response may contain multiple concatenated `DD EE FF 0D ...` frames, each `PARAM`:
 
@@ -82,7 +112,7 @@ Returns nothing (zero-byte response) while Dual Link is off. While on, response 
 0x02 | device_index(1) | name (ASCII) | 6 trailing bytes (unconfirmed)
 ```
 
-## Not covered
+### Not covered
 
 - Factory reset.
 - Custom/per-band EQ editing.
