@@ -13,13 +13,14 @@ _MAC_RE = re.compile(r"&([0-9A-F]{12})_C\d+$")
 
 def _bluetooth_device_names() -> dict:
     try:
+        creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
         out = subprocess.run(
             [
                 "powershell", "-NoProfile", "-Command",
                 "Get-PnpDevice | Where-Object { $_.InstanceId -match 'BTHENUM\\\\DEV_' } "
                 "| Select-Object FriendlyName, InstanceId | ConvertTo-Json -Compress",
             ],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, creationflags=creationflags,
         )
         data = json.loads(out.stdout)
         if isinstance(data, dict):
