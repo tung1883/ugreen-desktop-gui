@@ -1,7 +1,10 @@
 # UGREEN Studio Pro PC Control
-A reverse-engineered desktop GUI for controlling UGREEN Studio Pro headphones
-Mostly for Windows. If you want a version for other platforms, read the procotol below and build it yourself!
-*Note: Remember to pair the headphone with Windows first
+
+A reverse-engineered desktop GUI for controlling UGREEN Studio Pro headphones.
+
+Mostly for Windows. If you want a version for other platforms, read the protocol below and build it yourself!
+
+*Note: Remember to pair the headphone with Windows first*
 
 ## Building the binary
 ```
