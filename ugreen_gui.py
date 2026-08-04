@@ -1,11 +1,23 @@
 import os
+import json
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _LOGO_PATH = os.path.join(_SCRIPT_DIR, "ugreen_logo.png")
 _ICO_PATH = os.path.join(_SCRIPT_DIR, "ugreen_logo.ico")
+
+_CONFIG_DIR = _SCRIPT_DIR
+_CONFIG_PATH = os.path.join(_CONFIG_DIR, "settings.json")
+
+_PERSIST_KEYS = (
+    "eq_preset", "anc_raw", "spatial_audio", "game_mode", "wind_noise_reduction",
+    "dual_link", "hires_audio", "prompt_volume", "broadcast_voice",
+)
+
+_STATUS_POLL_MS = 3000
 
 try:
     import ctypes
@@ -45,6 +57,42 @@ BUTTON_ACTIONS = [
 _MUTUALLY_EXCLUSIVE = {"Hi-Res audio", "Dual link"}
 
 
+def _push_saved_settings(client: UgreenClient, saved: dict):
+    if "eq_preset" in saved:
+        client.set_eq_preset(saved["eq_preset"])
+        time.sleep(0.15)
+    if "anc_raw" in saved:
+        anc_raw = saved["anc_raw"]
+        if anc_raw == 0xA0:
+            client.set_anc_off()
+        elif anc_raw == 0xA2:
+            client.set_anc_ambient()
+        else:
+            client.set_anc_level(anc_raw)
+        time.sleep(0.15)
+    if "spatial_audio" in saved:
+        client.set_spatial_audio(saved["spatial_audio"])
+        time.sleep(0.15)
+    if "game_mode" in saved:
+        client.set_game_mode(saved["game_mode"])
+        time.sleep(0.15)
+    if "wind_noise_reduction" in saved:
+        client.set_wind_noise_reduction(saved["wind_noise_reduction"])
+        time.sleep(0.15)
+    if "hires_audio" in saved:
+        client.set_hires_audio(saved["hires_audio"])
+        time.sleep(0.15)
+    if "dual_link" in saved:
+        client.set_dual_link(saved["dual_link"])
+        time.sleep(0.15)
+    if "prompt_volume" in saved:
+        client.set_prompt_volume(saved["prompt_volume"])
+        time.sleep(0.15)
+    if "broadcast_voice" in saved:
+        client.set_broadcast_voice_language(saved["broadcast_voice"])
+        time.sleep(0.15)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -74,6 +122,8 @@ class App(tk.Tk):
         self.toggle_buttons = {}
         self.voice_buttons = {}
         self._status_refresh_busy = False
+        self._poll_after_id = None
+        self._saved_settings = self._load_settings()
 
         self._build_connection_bar()
         self._build_eq_section()
@@ -106,10 +156,11 @@ class App(tk.Tk):
         self.connect_btn = ttk.Button(frame, text="Connect", command=self._toggle_connect)
         self.connect_btn.grid(row=0, column=3, padx=5)
         ttk.Button(frame, text="Refresh status", command=self._refresh_status).grid(row=0, column=4, padx=5)
+        ttk.Button(frame, text="Log", command=self._open_log_window).grid(row=0, column=5, padx=5)
 
         self.battery_var = tk.StringVar(value="Battery: -")
         ttk.Label(frame, textvariable=self.battery_var, foreground="gray", width=14, anchor="w").grid(
-            row=0, column=5, padx=(15, 5)
+            row=0, column=6, padx=(15, 5)
         )
 
         self._port_by_label = {}
@@ -149,7 +200,7 @@ class App(tk.Tk):
             self.client = UgreenClient(self._selected_port())
             self.connect_btn.config(text="Disconnect")
             self._set_status(f"Auto-connected to {self.port_var.get()}")
-            self._refresh_status()
+            self._on_connected()
         except Exception as e:
             self._set_status(f"Auto-connect failed: {e}")
 
@@ -163,14 +214,82 @@ class App(tk.Tk):
                 self.client = UgreenClient(port)
                 self.connect_btn.config(text="Disconnect")
                 self._set_status(f"Connected to {self.port_var.get()}")
-                self._refresh_status()
+                self._on_connected()
             except Exception as e:
                 messagebox.showerror("Connection failed", str(e))
         else:
+            self._stop_status_polling()
+            self.client.remove_listener(self._on_unsolicited_frame)
+            self.client.on_frame_log = None
             self.client.close()
             self.client = None
             self.connect_btn.config(text="Connect")
             self._set_status("Not connected")
+
+    def _load_settings(self):
+        try:
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_settings(self, status):
+        changed = False
+        for key in _PERSIST_KEYS:
+            if key in status and status[key] is not None and self._saved_settings.get(key) != status[key]:
+                self._saved_settings[key] = status[key]
+                changed = True
+        if not changed:
+            return
+        try:
+            os.makedirs(_CONFIG_DIR, exist_ok=True)
+            with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._saved_settings, f)
+        except Exception:
+            pass
+
+    def _on_connected(self):
+        self.client.add_listener(self._on_unsolicited_frame)
+        self.client.on_frame_log = self._on_frame_log
+        if not self._saved_settings:
+            self._refresh_status()
+        else:
+            self._apply_saved_settings()
+        self._start_status_polling()
+
+    def _on_unsolicited_frame(self, cmd, payload):
+        # Runs on the client's background reader thread. Any frame that wasn't
+        # claimed by one of our own pending requests means the earbuds pushed it
+        # on their own (setting changed from the phone, a device joined/left, etc).
+        if cmd in (0x04, 0x0D):
+            self.after(0, self._refresh_status)
+
+    def _apply_saved_settings(self):
+        client = self.client
+        saved = dict(self._saved_settings)
+        self._set_status("Applying saved settings...")
+
+        def worker():
+            try:
+                _push_saved_settings(client, saved)
+            except Exception as e:
+                self.after(0, lambda: self._set_status(f"Failed to apply saved settings: {e}"))
+            self.after(0, self._refresh_status)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_status_polling(self):
+        self._poll_status()
+
+    def _stop_status_polling(self):
+        if self._poll_after_id is not None:
+            self.after_cancel(self._poll_after_id)
+            self._poll_after_id = None
+
+    def _poll_status(self):
+        if self.client is not None:
+            self._refresh_status()
+        self._poll_after_id = self.after(_STATUS_POLL_MS, self._poll_status)
 
     def _set_status(self, text: str):
         self.status.set(text)
@@ -214,12 +333,10 @@ class App(tk.Tk):
             except Exception as e:
                 self.after(0, lambda: self._on_status_error(f"Status query failed: {e}"))
                 return
-            devices = None
-            if status.get("dual_link"):
-                try:
-                    devices = client.query_connected_devices()
-                except Exception:
-                    devices = None
+            try:
+                devices = client.query_connected_devices()
+            except Exception:
+                devices = None
             self.after(0, lambda: self._apply_status(status, devices))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -266,9 +383,7 @@ class App(tk.Tk):
             if key in status and name in self.toggle_buttons:
                 self._mark_active(self.toggle_buttons[name], "on" if status[key] else "off")
 
-        if not status.get("dual_link"):
-            self.connected_devices_var.set("(device list unavailable while Dual Link is off)")
-        elif devices:
+        if devices:
             self.connected_devices_var.set("Connected: " + ", ".join(devices))
         elif devices is not None:
             self.connected_devices_var.set("Connected: -")
@@ -278,6 +393,12 @@ class App(tk.Tk):
         voice_val = status.get("broadcast_voice")
         if voice_val in self.voice_buttons:
             self._mark_active(self.voice_buttons, voice_val)
+
+        prompt_volume = status.get("prompt_volume")
+        if prompt_volume is not None:
+            self.vol_var.set(prompt_volume)
+
+        self._save_settings(status)
 
     def _build_eq_section(self):
         frame = ttk.LabelFrame(self, text="EQ preset")
@@ -463,7 +584,70 @@ class App(tk.Tk):
             lambda c: c.set_anc_button_actions(single, double, hold)
         )
 
+    def _open_log_window(self):
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.lift()
+            self.log_window.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Bluetooth log")
+        win.geometry("700x400")
+        win.protocol("WM_DELETE_WINDOW", self._close_log_window)
+        self.log_window = win
+
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+
+        self.log_text = tk.Text(text_frame, state="disabled", font=("Consolas", 9), wrap="none")
+        self.log_text.grid(row=0, column=0, sticky="nswe")
+        scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.log_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=scroll.set)
+
+        ttk.Button(win, text="Clear log", command=self._clear_log).pack(anchor="w", padx=5, pady=(0, 5))
+
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", "".join(self._log_lines))
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _close_log_window(self):
+        if self.log_window is not None:
+            self.log_window.destroy()
+        self.log_window = None
+        self.log_text = None
+
+    def _on_frame_log(self, direction, data):
+        self.after(0, lambda: self._log_frame(direction, data))
+
+    def _log_frame(self, direction, data: bytes):
+        ts = time.strftime("%H:%M:%S")
+        line = f"{ts} {direction:<2} {data.hex(' ').upper()}\n"
+        self._log_lines.append(line)
+        if len(self._log_lines) > 500:
+            self._log_lines = self._log_lines[-500:]
+
+        if self.log_text is not None:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line)
+            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            if line_count > 500:
+                self.log_text.delete("1.0", f"{line_count - 500}.0")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+
+    def _clear_log(self):
+        self._log_lines = []
+        if self.log_text is not None:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
+
     def _on_close(self):
+        self._stop_status_polling()
         if self.client is not None:
             self.client.close()
         self.destroy()

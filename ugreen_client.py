@@ -102,12 +102,74 @@ ANC_NAMES = {
 }
 
 
+def parse_status_payload(param: bytes) -> dict:
+    result = {"raw": param.hex()}
+    if len(param) > 0:
+        result["battery"] = param[0] if param[0] != 0xFF else None
+    if len(param) > 1:
+        result["case_battery"] = param[1] if param[1] != 0xFF else None
+    if len(param) > 2:
+        result["right_battery"] = param[2] if param[2] != 0xFF else None
+    if len(param) > 3:
+        result["anc_raw"] = param[3]
+        result["anc"] = ANC_NAMES.get(param[3], f"unknown (0x{param[3]:02X})")
+    if len(param) > 4:
+        result["eq_preset"] = param[4]
+        result["eq"] = EQ_NAMES.get(param[4], f"unknown ({param[4]})")
+    if len(param) > 5:
+        result["dual_link"] = bool(param[5])
+    if len(param) > 6:
+        result["game_mode"] = bool(param[6])
+    if len(param) > 7:
+        result["hires_audio"] = bool(param[7])
+    if len(param) > 8:
+        result["anc_button_single_click"] = param[8]
+    if len(param) > 9:
+        result["anc_button_double_click"] = param[9]
+    if len(param) > 11:
+        result["anc_button_press_hold"] = param[11]
+    if len(param) > 16:
+        result["broadcast_voice"] = param[16]
+        result["broadcast_voice_name"] = {0: "English", 1: "Chinese", 2: "Ringtone"}.get(
+            param[16], f"unknown ({param[16]})"
+        )
+    if len(param) > 19:
+        result["prompt_volume"] = param[19]
+    if len(param) > 20:
+        result["spatial_audio"] = bool(param[20])
+    if len(param) > 25:
+        result["wind_noise_reduction"] = bool(param[25])
+    return result
+
+
 class UgreenClient:
+    """
+    The earbuds push unsolicited status/device-list frames on their own (e.g. when a
+    setting changes from the phone app, or a device joins/leaves in dual-link mode) -
+    not just in reply to our own queries. A single background thread owns all reads
+    off the port and dispatches every complete frame it sees; frames that answer one
+    of our own pending requests go to that request, everything else (including
+    device-initiated pushes) is broadcast to registered listeners for live updates.
+    """
+
     def __init__(self, port: str, timeout: float = 3.0):
-        self.ser = serial.Serial(port=port, baudrate=115200, timeout=timeout)
-        self.lock = threading.RLock()
+        self.ser = serial.Serial(port=port, baudrate=115200, timeout=0.1)
+        self.write_lock = threading.Lock()
+        self.default_timeout = timeout
+        self._rx_buf = bytearray()
+        self._listeners = []
+        self._reply_queues = {}
+        self._stop = False
+        self.on_frame_log = None  # optional callback(direction: "TX"/"RX", data: bytes)
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
 
     def close(self):
+        self._stop = True
+        try:
+            self._reader_thread.join(timeout=1)
+        except Exception:
+            pass
         self.ser.close()
 
     def __enter__(self):
