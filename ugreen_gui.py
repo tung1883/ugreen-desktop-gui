@@ -84,10 +84,11 @@ class App(tk.Tk):
         self._build_buttons_section()
         self._build_volume_buttons_section()
 
+        self._log_lines = []
+        self.log_window = None
+        self.log_text = None
+
         self.status = tk.StringVar(value="Not connected")
-        ttk.Label(self, textvariable=self.status, foreground="gray").grid(
-            row=99, column=0, columnspan=4, sticky="w", padx=10, pady=(10, 10)
-        )
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._auto_connect)
