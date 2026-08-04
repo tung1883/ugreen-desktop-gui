@@ -1,5 +1,6 @@
 import re
 import json
+import queue
 import subprocess
 import threading
 import time
@@ -178,86 +179,102 @@ class UgreenClient:
     def __exit__(self, *exc):
         self.close()
 
-    def _send(self, cmd: int, param: bytes = b""):
-        frame = build_frame(cmd, param)
-        with self.lock:
-            self.ser.write(frame)
-        return frame
+    def add_listener(self, callback):
+        """callback(cmd, payload) is invoked from a background thread for every frame
+        that isn't the reply to one of our own pending requests (i.e. device-pushed)."""
+        self._listeners.append(callback)
 
-    def query_status(self) -> dict:
-        with self.lock:
-            self.ser.reset_input_buffer()
-            self._send(0x04, bytes([0]))
-            time.sleep(0.5)
-            resp = self.ser.read(512)
-        if not resp.startswith(b"\xDD\xEE\xFF\x04"):
-            return {"raw": resp.hex(), "error": "no/unexpected response"}
+    def remove_listener(self, callback):
+        try:
+            self._listeners.remove(callback)
+        except ValueError:
+            pass
 
-        length = resp[5]
-        param = resp[6:6 + length]
-        result = {"raw": param.hex()}
-        if len(param) > 0:
-            result["battery"] = param[0] if param[0] != 0xFF else None
-        if len(param) > 1:
-            result["case_battery"] = param[1] if param[1] != 0xFF else None
-        if len(param) > 2:
-            result["right_battery"] = param[2] if param[2] != 0xFF else None
-        if len(param) > 3:
-            result["anc_raw"] = param[3]
-            result["anc"] = ANC_NAMES.get(param[3], f"unknown (0x{param[3]:02X})")
-        if len(param) > 4:
-            result["eq_preset"] = param[4]
-            result["eq"] = EQ_NAMES.get(param[4], f"unknown ({param[4]})")
-        if len(param) > 5:
-            result["dual_link"] = bool(param[5])
-        if len(param) > 6:
-            result["game_mode"] = bool(param[6])
-        if len(param) > 7:
-            result["hires_audio"] = bool(param[7])
-        if len(param) > 8:
-            result["anc_button_single_click"] = param[8]
-        if len(param) > 9:
-            result["anc_button_double_click"] = param[9]
-        if len(param) > 11:
-            result["anc_button_press_hold"] = param[11]
-        if len(param) > 16:
-            result["broadcast_voice"] = param[16]
-            result["broadcast_voice_name"] = {0: "English", 1: "Chinese", 2: "Ringtone"}.get(
-                param[16], f"unknown ({param[16]})"
-            )
-        if len(param) > 19:
-            result["prompt_volume"] = param[19]
-        if len(param) > 20:
-            result["spatial_audio"] = bool(param[20])
-        if len(param) > 25:
-            result["wind_noise_reduction"] = bool(param[25])
-        return result
-
-    def query_connected_devices(self) -> list:
-        with self.lock:
-            self.ser.reset_input_buffer()
-            self._send(0x0D, bytes([0]))
-            time.sleep(0.3)
-            old_timeout = self.ser.timeout
-            self.ser.timeout = 0.5
+    def _reader_loop(self):
+        while not self._stop:
             try:
-                resp = self.ser.read(1024)
-            finally:
-                self.ser.timeout = old_timeout
+                chunk = self.ser.read(256)
+            except Exception:
+                return
+            if chunk:
+                self._rx_buf.extend(chunk)
+                self._dispatch_frames()
 
-        devices = []
+    def _dispatch_frames(self):
+        buf = self._rx_buf
         i = 0
-        while i + 6 <= len(resp):
-            if resp[i:i + 3] != b"\xDD\xEE\xFF" or resp[i + 3] != 0x0D:
+        while i + 6 <= len(buf):
+            if buf[i:i + 3] != b"\xDD\xEE\xFF":
                 i += 1
                 continue
-            length = resp[i + 5]
-            payload = resp[i + 6:i + 6 + length]
-            if len(payload) == length and length > 8:
+            cmd = buf[i + 3]
+            length = buf[i + 5]
+            end = i + 6 + length + 2
+            if end > len(buf):
+                break
+            payload = bytes(buf[i + 6:i + 6 + length])
+            if self.on_frame_log:
+                try:
+                    self.on_frame_log("RX", bytes(buf[i:end]))
+                except Exception:
+                    pass
+            q = self._reply_queues.get(cmd)
+            if q is not None:
+                q.put(payload)
+            else:
+                for cb in list(self._listeners):
+                    try:
+                        cb(cmd, payload)
+                    except Exception:
+                        pass
+            i = end
+        del buf[:i]
+
+    def _send(self, cmd: int, param: bytes = b""):
+        frame = build_frame(cmd, param)
+        with self.write_lock:
+            self.ser.write(frame)
+        if self.on_frame_log:
+            try:
+                self.on_frame_log("TX", frame)
+            except Exception:
+                pass
+        return frame
+
+    def _request(self, cmd: int, param: bytes, reply_cmd: int, timeout: float = None):
+        q = queue.Queue()
+        self._reply_queues[reply_cmd] = q
+        try:
+            self._send(cmd, param)
+            try:
+                return q.get(timeout=timeout or self.default_timeout)
+            except queue.Empty:
+                return None
+        finally:
+            if self._reply_queues.get(reply_cmd) is q:
+                del self._reply_queues[reply_cmd]
+
+    def query_status(self) -> dict:
+        payload = self._request(0x04, bytes([0]), reply_cmd=0x04, timeout=1.0)
+        if payload is None:
+            return {"error": "no/unexpected response"}
+        return parse_status_payload(payload)
+
+    def query_connected_devices(self, window: float = 0.6) -> list:
+        devices = []
+
+        def collector(cmd, payload):
+            if cmd == 0x0D and len(payload) > 8:
                 index = payload[1]
-                name = payload[2:length - 6].decode("ascii", errors="replace")
+                name = payload[2:len(payload) - 6].decode("ascii", errors="replace")
                 devices.append((index, name))
-            i += 6 + length + 2
+
+        self.add_listener(collector)
+        try:
+            self._send(0x0D, bytes([0]))
+            time.sleep(window)
+        finally:
+            self.remove_listener(collector)
         devices.sort(key=lambda d: d[0])
         return [name for _, name in devices]
 
