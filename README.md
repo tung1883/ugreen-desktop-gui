@@ -89,5 +89,4 @@ Returns nothing (zero-byte response) while Dual Link is off. While on, response 
 
 ### Skippies
 - Factory reset
-- Custom/per-band EQ editing
 - Offsets 10, 12–15, 17–18, 21–24, 26+ in the status payload
