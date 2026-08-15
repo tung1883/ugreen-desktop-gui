@@ -123,6 +123,12 @@ class App(tk.Tk):
         self.voice_buttons = {}
         self._status_refresh_busy = False
         self._poll_after_id = None
+        self._reconnect_after_id = None
+        self._reconnect_attempts = 0
+        self._last_port_label = None
+        self._consecutive_status_failures = 0
+        self._connecting = False
+        self._settings_applied_this_session = False
         self._saved_settings = self._load_settings()
 
         self._build_connection_bar()
@@ -193,38 +199,101 @@ class App(tk.Tk):
     def _selected_port(self):
         return self._port_by_label.get(self.port_var.get())
 
+    def _open_client_async(self, port, on_success, on_failure, timeout_ms=6000):
+        # Opening the serial port is itself a blocking OS call that can stall on a
+        # flaky virtual Bluetooth SPP driver (e.g. right after a disconnect, before
+        # Windows has fully released the COM port) - and unlike ser.write(), the
+        # serial.Serial() constructor has no configurable timeout at all, so it can
+        # hang indefinitely with no exception. Never do this on the Tk thread, and
+        # never let a hung open leave the caller waiting forever: race it against a
+        # hard deadline and report failure if the deadline wins.
+        state = {"done": False}
+        lock = threading.Lock()
+
+        def finish(client=None, exc=None):
+            with lock:
+                if state["done"]:
+                    if client is not None:
+                        # Worker finished late, after we'd already given up on it -
+                        # don't leak an open port that the next retry might need.
+                        threading.Thread(target=client.close, daemon=True).start()
+                    return
+                state["done"] = True
+            if client is not None:
+                on_success(client)
+            else:
+                on_failure(exc)
+
+        def worker():
+            try:
+                client = UgreenClient(port)
+            except Exception as e:
+                # Python clears the 'except ... as e' binding once this block ends, so
+                # a lambda that only reads 'e' when self.after() later fires would hit
+                # NameError. Bind it as a default arg to capture the value now.
+                self.after(0, lambda e=e: finish(exc=e))
+                return
+            self.after(0, lambda: finish(client=client))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(timeout_ms, lambda: finish(exc=TimeoutError("port open timed out")))
+
     def _auto_connect(self):
-        if self.client is not None or not self._selected_port():
+        if self.client is not None or self._connecting or not self._selected_port():
             return
-        try:
-            self.client = UgreenClient(self._selected_port())
+        port = self._selected_port()
+        label = self.port_var.get()
+        self._connecting = True
+
+        def on_success(client):
+            self._connecting = False
+            self.client = client
             self.connect_btn.config(text="Disconnect")
-            self._set_status(f"Auto-connected to {self.port_var.get()}")
+            self._last_port_label = label
+            self._set_status(f"Auto-connected to {label}")
             self._on_connected()
-        except Exception as e:
+
+        def on_failure(e):
+            self._connecting = False
             self._set_status(f"Auto-connect failed: {e}")
 
+        self._open_client_async(port, on_success, on_failure)
+
     def _toggle_connect(self):
+        self._cancel_reconnect()
         if self.client is None:
+            if self._connecting:
+                return
             port = self._selected_port()
             if not port:
                 messagebox.showwarning("No port selected", "No Bluetooth SPP COM port detected. Pair the earbuds first, then click Refresh ports.")
                 return
-            try:
-                self.client = UgreenClient(port)
+            label = self.port_var.get()
+            self._connecting = True
+
+            def on_success(client):
+                self._connecting = False
+                self.client = client
                 self.connect_btn.config(text="Disconnect")
-                self._set_status(f"Connected to {self.port_var.get()}")
+                self._last_port_label = label
+                self._set_status(f"Connected to {label}")
                 self._on_connected()
-            except Exception as e:
+
+            def on_failure(e):
+                self._connecting = False
                 messagebox.showerror("Connection failed", str(e))
+
+            self._open_client_async(port, on_success, on_failure)
         else:
             self._stop_status_polling()
-            self.client.remove_listener(self._on_unsolicited_frame)
-            self.client.on_frame_log = None
-            self.client.close()
+            client = self.client
+            client.remove_listener(self._on_unsolicited_frame)
+            client.on_frame_log = None
+            client.on_disconnect = None
             self.client = None
             self.connect_btn.config(text="Connect")
             self._set_status("Not connected")
+            threading.Thread(target=client.close, daemon=True).start()
 
     def _load_settings(self):
         try:
@@ -249,20 +318,120 @@ class App(tk.Tk):
             pass
 
     def _on_connected(self):
-        self.client.add_listener(self._on_unsolicited_frame)
-        self.client.on_frame_log = self._on_frame_log
-        if not self._saved_settings:
-            self._refresh_status()
-        else:
+        self._consecutive_status_failures = 0
+        client = self.client
+        client.add_listener(self._on_unsolicited_frame)
+        client.on_frame_log = self._on_frame_log
+        # Bind the callback to this specific client instance. Two different code
+        # paths (the write watchdog and a failed status poll) can each independently
+        # decide "this client died" and schedule _handle_disconnect around the same
+        # time; if a reconnect races ahead and replaces self.client in between, a
+        # late/stale notification from the OLD client must never tear down the NEW
+        # one just because self.client happened to be truthy again.
+        client.on_disconnect = lambda: self.after(0, lambda: self._handle_disconnect(client))
+        # Only replay saved settings on the very first connect of this app session.
+        # The earbuds keep their own settings across reconnects, so re-pushing them
+        # on every reconnect is both unnecessary and actively harmful: one of those
+        # saved settings can be Hi-Res audio, and resending "Hi-Res on" is the exact
+        # command that triggers a codec renegotiation and drops the link - turning a
+        # single disconnect into an endless resend-disconnect-reconnect loop that
+        # only stopped when the app was closed.
+        #
+        # The flag must be set to True on the first connect NO MATTER WHAT, even if
+        # there was nothing saved yet to push - otherwise, on a fresh install with no
+        # settings.json, the first connect populates _saved_settings from the status
+        # it just read, and the *second* connect (the very next reconnect) would then
+        # wrongly qualify as "first" and push it - reintroducing the same loop one
+        # reconnect later.
+        first_connect_of_session = not self._settings_applied_this_session
+        self._settings_applied_this_session = True
+        if first_connect_of_session and self._saved_settings:
             self._apply_saved_settings()
+        else:
+            self._refresh_status()
         self._start_status_polling()
+
+    def _handle_disconnect(self, client=None):
+        if client is not None and client is not self.client:
+            return
+        if self.client is None:
+            return
+        self._stop_status_polling()
+        client = self.client
+        try:
+            client.remove_listener(self._on_unsolicited_frame)
+            client.on_frame_log = None
+            client.on_disconnect = None
+        except Exception:
+            pass
+        self.client = None
+        threading.Thread(target=client.close, daemon=True).start()
+        self.connect_btn.config(text="Connect")
+        self._set_status("Device disconnected - reconnecting...")
+        self._reconnect_attempts = 0
+        # Give the device/OS a real head start on its own reconnection before we
+        # touch the port ourselves.
+        self._schedule_reconnect(5000)
+
+    def _cancel_reconnect(self):
+        if self._reconnect_after_id is not None:
+            self.after_cancel(self._reconnect_after_id)
+            self._reconnect_after_id = None
+
+    def _schedule_reconnect(self, delay_ms):
+        self._cancel_reconnect()
+        self._reconnect_after_id = self.after(delay_ms, self._attempt_reconnect)
+
+    def _attempt_reconnect(self):
+        self._reconnect_after_id = None
+        if self.client is not None or self._connecting:
+            return
+        self._refresh_ports()
+        if self._last_port_label and self._last_port_label in self._port_by_label:
+            self.port_var.set(self._last_port_label)
+            port = self._port_by_label[self._last_port_label]
+        else:
+            port = self._selected_port()
+
+        if not port:
+            self._reconnect_give_up_or_retry()
+            return
+
+        label = self.port_var.get()
+        self._connecting = True
+
+        def on_success(client):
+            self._connecting = False
+            if self.client is not None:
+                # a manual connect already won the race while this attempt was in flight
+                threading.Thread(target=client.close, daemon=True).start()
+                return
+            self.client = client
+            self.connect_btn.config(text="Disconnect")
+            self._last_port_label = label
+            self._set_status(f"Reconnected to {label}")
+            self._on_connected()
+
+        def on_failure(e):
+            self._connecting = False
+            self._reconnect_give_up_or_retry()
+
+        self._open_client_async(port, on_success, on_failure)
+
+    def _reconnect_give_up_or_retry(self):
+        self._reconnect_attempts += 1
+        if self._reconnect_attempts >= 15:
+            self._set_status("Reconnect failed - use the Connect button to retry.")
+            return
+        self._set_status("Device disconnected - reconnecting...")
+        self._schedule_reconnect(5000)
 
     def _on_unsolicited_frame(self, cmd, payload):
         # Runs on the client's background reader thread. Any frame that wasn't
         # claimed by one of our own pending requests means the earbuds pushed it
         # on their own (setting changed from the phone, a device joined/left, etc).
         if cmd in (0x04, 0x0D):
-            self.after(0, self._refresh_status)
+            self.after(0, lambda: self._refresh_status(warn_if_disconnected=False))
 
     def _apply_saved_settings(self):
         client = self.client
@@ -273,8 +442,8 @@ class App(tk.Tk):
             try:
                 _push_saved_settings(client, saved)
             except Exception as e:
-                self.after(0, lambda: self._set_status(f"Failed to apply saved settings: {e}"))
-            self.after(0, self._refresh_status)
+                self.after(0, lambda e=e: self._set_status(f"Failed to apply saved settings: {e}"))
+            self.after(0, lambda: self._refresh_status(warn_if_disconnected=False))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -288,7 +457,7 @@ class App(tk.Tk):
 
     def _poll_status(self):
         if self.client is not None:
-            self._refresh_status()
+            self._refresh_status(warn_if_disconnected=False)
         self._poll_after_id = self.after(_STATUS_POLL_MS, self._poll_status)
 
     def _set_status(self, text: str):
@@ -310,16 +479,24 @@ class App(tk.Tk):
         if self.client is None:
             messagebox.showwarning("Not connected", "Connect to a device first.")
             return
-        try:
-            frame = fn(self.client)
-            self._set_status(f"{label}: sent {frame.hex().upper()}")
-        except Exception as e:
-            messagebox.showerror("Command failed", str(e))
-            self._set_status(f"{label}: FAILED - {e}")
+        client = self.client
+        self._set_status(f"{label}: sending...")
 
-    def _refresh_status(self):
+        def worker():
+            try:
+                frame = fn(client)
+            except Exception as e:
+                self.after(0, lambda e=e: self._set_status(f"{label}: FAILED - {e}"))
+                self.after(0, lambda e=e: messagebox.showerror("Command failed", str(e)))
+                return
+            self.after(0, lambda: self._set_status(f"{label}: sent {frame.hex().upper()}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_status(self, warn_if_disconnected=True):
         if self.client is None:
-            messagebox.showwarning("Not connected", "Connect to a device first.")
+            if warn_if_disconnected:
+                messagebox.showwarning("Not connected", "Connect to a device first.")
             return
         if self._status_refresh_busy:
             return
@@ -331,25 +508,31 @@ class App(tk.Tk):
             try:
                 status = client.query_status()
             except Exception as e:
-                self.after(0, lambda: self._on_status_error(f"Status query failed: {e}"))
+                self.after(0, lambda e=e: self._on_status_error(f"Status query failed: {e}", client))
                 return
             try:
                 devices = client.query_connected_devices()
             except Exception:
                 devices = None
-            self.after(0, lambda: self._apply_status(status, devices))
+            self.after(0, lambda: self._apply_status(status, devices, client))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_status_error(self, message):
+    def _on_status_error(self, message, client):
         self._status_refresh_busy = False
         self._set_status(message)
+        self._handle_disconnect(client)
 
-    def _apply_status(self, status, devices):
+    def _apply_status(self, status, devices, client):
         self._status_refresh_busy = False
         if "error" in status:
             self._set_status(f"Status query: {status['error']} (raw={status.get('raw', '')})")
+            if client is self.client:
+                self._consecutive_status_failures += 1
+                if self._consecutive_status_failures >= 2:
+                    self._handle_disconnect(client)
             return
+        self._consecutive_status_failures = 0
         summary = (
             f"ANC={status.get('anc', '?')}  EQ={status.get('eq', '?')}  "
             f"Game={'On' if status.get('game_mode') else 'Off'}  "
@@ -503,7 +686,11 @@ class App(tk.Tk):
         self._run(f"{name} {'on' if on else 'off'}", lambda c: fn(c, on))
         self._mark_active(self.toggle_buttons[name], "on" if on else "off")
         if name in _MUTUALLY_EXCLUSIVE:
-            self.after(1500, self._refresh_status)
+            # Hi-Res audio in particular disconnects the device to renegotiate its
+            # codec, so this follow-up refresh commonly lands in the window where
+            # self.client is briefly None again - must not pop the "not connected"
+            # warning dialog for what is just the toggle's own expected side effect.
+            self.after(1500, lambda: self._refresh_status(warn_if_disconnected=False))
 
     def _build_voice_section(self):
         frame = ttk.LabelFrame(self, text="Broadcast voice language")
@@ -648,6 +835,7 @@ class App(tk.Tk):
 
     def _on_close(self):
         self._stop_status_polling()
+        self._cancel_reconnect()
         if self.client is not None:
             self.client.close()
         self.destroy()

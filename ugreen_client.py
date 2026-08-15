@@ -154,14 +154,16 @@ class UgreenClient:
     """
 
     def __init__(self, port: str, timeout: float = 3.0):
-        self.ser = serial.Serial(port=port, baudrate=115200, timeout=0.1)
+        self.ser = serial.Serial(port=port, baudrate=115200, timeout=0.1, write_timeout=1.0)
         self.write_lock = threading.Lock()
         self.default_timeout = timeout
         self._rx_buf = bytearray()
         self._listeners = []
         self._reply_queues = {}
         self._stop = False
+        self._dead = False
         self.on_frame_log = None  # optional callback(direction: "TX"/"RX", data: bytes)
+        self.on_disconnect = None  # optional callback(), fired at most once if the port dies
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
 
@@ -171,7 +173,22 @@ class UgreenClient:
             self._reader_thread.join(timeout=1)
         except Exception:
             pass
-        self.ser.close()
+        # ser.close() can itself hang on some virtual Bluetooth SPP drivers if a
+        # write is stuck mid-call; never let it block the caller (often the GUI thread).
+        closer = threading.Thread(target=self.ser.close, daemon=True)
+        closer.start()
+        closer.join(timeout=1.0)
+
+    def _mark_dead(self):
+        if self._dead:
+            return
+        self._dead = True
+        self._stop = True
+        if self.on_disconnect:
+            try:
+                self.on_disconnect()
+            except Exception:
+                pass
 
     def __enter__(self):
         return self
@@ -195,6 +212,7 @@ class UgreenClient:
             try:
                 chunk = self.ser.read(256)
             except Exception:
+                self._mark_dead()
                 return
             if chunk:
                 self._rx_buf.extend(chunk)
@@ -232,8 +250,45 @@ class UgreenClient:
 
     def _send(self, cmd: int, param: bytes = b""):
         frame = build_frame(cmd, param)
-        with self.write_lock:
-            self.ser.write(frame)
+        if self._dead:
+            raise ConnectionError("device connection is dead")
+
+        # write_timeout on serial.Serial is not reliably honored by every virtual
+        # Bluetooth SPP driver on Windows - ser.write() can hang indefinitely past
+        # the configured timeout when the link drops mid-write (e.g. during a codec
+        # renegotiation). If we called ser.write() directly under write_lock, a single
+        # stuck write would jam that lock forever and silently freeze every future
+        # send (including status polling) with no error ever surfacing. Running the
+        # write in a throwaway thread and giving up on it after a hard deadline keeps
+        # this call - and the lock - bounded no matter what the driver does.
+        # A brief codec renegotiation (e.g. toggling Hi-Res audio) can legitimately
+        # stall the link for a few seconds without it actually being dead - give it
+        # real room before giving up, since declaring it dead tears down the port
+        # and can itself collide with the device's own in-progress reconnection.
+        if not self.write_lock.acquire(timeout=6.0):
+            self._mark_dead()
+            raise TimeoutError("write lock busy - device unresponsive")
+        try:
+            result = {}
+
+            def _do_write():
+                try:
+                    self.ser.write(frame)
+                except Exception as e:
+                    result["exc"] = e
+
+            writer = threading.Thread(target=_do_write, daemon=True)
+            writer.start()
+            writer.join(timeout=6.0)
+            if writer.is_alive():
+                self._mark_dead()
+                raise TimeoutError("write timed out - device unresponsive")
+            if "exc" in result:
+                self._mark_dead()
+                raise result["exc"]
+        finally:
+            self.write_lock.release()
+
         if self.on_frame_log:
             try:
                 self.on_frame_log("TX", frame)
@@ -255,7 +310,7 @@ class UgreenClient:
                 del self._reply_queues[reply_cmd]
 
     def query_status(self) -> dict:
-        payload = self._request(0x04, bytes([0]), reply_cmd=0x04, timeout=1.0)
+        payload = self._request(0x04, bytes([0]), reply_cmd=0x04, timeout=2.5)
         if payload is None:
             return {"error": "no/unexpected response"}
         return parse_status_payload(payload)
