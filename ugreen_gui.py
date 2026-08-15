@@ -56,6 +56,13 @@ BUTTON_ACTIONS = [
 
 _MUTUALLY_EXCLUSIVE = {"Hi-Res audio", "Dual link"}
 
+# Resending these two always drops the link to renegotiate (confirmed on real
+# hardware - even resending the value already in effect disconnects). They can
+# only be safely restored on the app's very first connect of a session (one
+# expected disconnect/reconnect there); auto-correcting them on every later
+# reconnect would recreate an endless resend-disconnect-reconnect loop.
+_DISRUPTIVE_KEYS = {"hires_audio", "dual_link"}
+
 
 def _push_saved_settings(client: UgreenClient, saved: dict):
     if "eq_preset" in saved:
@@ -329,26 +336,14 @@ class App(tk.Tk):
         # late/stale notification from the OLD client must never tear down the NEW
         # one just because self.client happened to be truthy again.
         client.on_disconnect = lambda: self.after(0, lambda: self._handle_disconnect(client))
-        # Only replay saved settings on the very first connect of this app session.
-        # The earbuds keep their own settings across reconnects, so re-pushing them
-        # on every reconnect is both unnecessary and actively harmful: one of those
-        # saved settings can be Hi-Res audio, and resending "Hi-Res on" is the exact
-        # command that triggers a codec renegotiation and drops the link - turning a
-        # single disconnect into an endless resend-disconnect-reconnect loop that
-        # only stopped when the app was closed.
-        #
         # The flag must be set to True on the first connect NO MATTER WHAT, even if
         # there was nothing saved yet to push - otherwise, on a fresh install with no
         # settings.json, the first connect populates _saved_settings from the status
         # it just read, and the *second* connect (the very next reconnect) would then
-        # wrongly qualify as "first" and push it - reintroducing the same loop one
-        # reconnect later.
+        # wrongly qualify as "first".
         first_connect_of_session = not self._settings_applied_this_session
         self._settings_applied_this_session = True
-        if first_connect_of_session and self._saved_settings:
-            self._apply_saved_settings()
-        else:
-            self._refresh_status()
+        self._sync_settings_after_connect(client, first_connect_of_session)
         self._start_status_polling()
 
     def _handle_disconnect(self, client=None):
@@ -433,16 +428,48 @@ class App(tk.Tk):
         if cmd in (0x04, 0x0D):
             self.after(0, lambda: self._refresh_status(warn_if_disconnected=False))
 
-    def _apply_saved_settings(self):
-        client = self.client
-        saved = dict(self._saved_settings)
-        self._set_status("Applying saved settings...")
+    def _sync_settings_after_connect(self, client, allow_disruptive):
+        # The earbuds reset some settings (ANC in particular) back to their own
+        # default on every fresh connection, independent of anything the app does.
+        # Read what the device actually has right now and correct any drift from
+        # what we last saved - except hires_audio/dual_link, which always disconnect
+        # the link when (re)sent (even to their current value), so those are only
+        # restored on the very first connect of this app session (one expected
+        # disconnect/reconnect there is fine); auto-correcting them on every later
+        # reconnect would recreate an endless resend-disconnect-reconnect loop.
+        if not self._saved_settings:
+            self._refresh_status(warn_if_disconnected=False)
+            return
+
+        self._set_status("Syncing settings...")
 
         def worker():
             try:
-                _push_saved_settings(client, saved)
+                status = client.query_status()
             except Exception as e:
-                self.after(0, lambda e=e: self._set_status(f"Failed to apply saved settings: {e}"))
+                self.after(0, lambda e=e: self._on_status_error(f"Status query failed: {e}", client))
+                return
+            if "error" in status:
+                self.after(0, lambda: self._apply_status(status, None, client))
+                return
+
+            to_push = {}
+            for key, value in self._saved_settings.items():
+                if key not in _PERSIST_KEYS:
+                    continue
+                if key in _DISRUPTIVE_KEYS:
+                    if not allow_disruptive:
+                        continue
+                if status.get(key) != value:
+                    to_push[key] = value
+
+            if to_push:
+                try:
+                    _push_saved_settings(client, to_push)
+                except Exception as e:
+                    self.after(0, lambda e=e: self._set_status(f"Failed to sync settings: {e}"))
+                    return
+
             self.after(0, lambda: self._refresh_status(warn_if_disconnected=False))
 
         threading.Thread(target=worker, daemon=True).start()

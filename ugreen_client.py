@@ -156,6 +156,7 @@ class UgreenClient:
     def __init__(self, port: str, timeout: float = 3.0):
         self.ser = serial.Serial(port=port, baudrate=115200, timeout=0.1, write_timeout=1.0)
         self.write_lock = threading.Lock()
+        self._request_lock = threading.Lock()
         self.default_timeout = timeout
         self._rx_buf = bytearray()
         self._listeners = []
@@ -297,17 +298,24 @@ class UgreenClient:
         return frame
 
     def _request(self, cmd: int, param: bytes, reply_cmd: int, timeout: float = None):
-        q = queue.Queue()
-        self._reply_queues[reply_cmd] = q
-        try:
-            self._send(cmd, param)
+        # This is a half-duplex link with one reply slot per cmd (self._reply_queues).
+        # If two threads call _request() for the same reply_cmd concurrently (e.g. a
+        # settings sync and the status poll both querying status right after a
+        # connect), the second registration silently overwrites the first's queue and
+        # the first caller's frame never arrives - it just times out. Serialize all
+        # request/reply round trips so only one is ever outstanding at a time.
+        with self._request_lock:
+            q = queue.Queue()
+            self._reply_queues[reply_cmd] = q
             try:
-                return q.get(timeout=timeout or self.default_timeout)
-            except queue.Empty:
-                return None
-        finally:
-            if self._reply_queues.get(reply_cmd) is q:
-                del self._reply_queues[reply_cmd]
+                self._send(cmd, param)
+                try:
+                    return q.get(timeout=timeout or self.default_timeout)
+                except queue.Empty:
+                    return None
+            finally:
+                if self._reply_queues.get(reply_cmd) is q:
+                    del self._reply_queues[reply_cmd]
 
     def query_status(self) -> dict:
         payload = self._request(0x04, bytes([0]), reply_cmd=0x04, timeout=2.5)
