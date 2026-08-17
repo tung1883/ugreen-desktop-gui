@@ -415,11 +415,17 @@ class App(tk.Tk):
 
     def _reconnect_give_up_or_retry(self):
         self._reconnect_attempts += 1
-        if self._reconnect_attempts >= 15:
-            self._set_status("Reconnect failed - use the Connect button to retry.")
-            return
-        self._set_status("Device disconnected - reconnecting...")
-        self._schedule_reconnect(5000)
+        # Keep retrying forever - the earbuds may stay off/out of range for a long
+        # time (e.g. overnight), and the whole point of this feature is that the app
+        # picks them back up without the user having to click Connect. Back off to a
+        # slower cadence after the initial burst so an extended absence doesn't mean
+        # hammering the port every 5s indefinitely.
+        if self._reconnect_attempts <= 15:
+            self._set_status("Device disconnected - reconnecting...")
+            self._schedule_reconnect(5000)
+        else:
+            self._set_status("Device disconnected - waiting for it to come back...")
+            self._schedule_reconnect(30000)
 
     def _on_unsolicited_frame(self, cmd, payload):
         # Runs on the client's background reader thread. Any frame that wasn't
